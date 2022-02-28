@@ -1,0 +1,175 @@
+#!/usr/bin/env python3
+"""
+Main file for CLI utility
+
+Copyright (c) 2021 Cisco and/or its affiliates.
+
+This software is licensed to you under the terms of the Cisco Sample
+Code License, Version 1.1 (the "License"). You may obtain a copy of the
+License at
+
+               https://developer.cisco.com/docs/licenses
+
+All use of the material herein must be in accordance with the terms of
+the License. All rights not expressly granted by the License are
+reserved. Unless required by applicable law or agreed to separately in
+writing, software distributed under the License is distributed on an "AS
+IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
+or implied.
+"""
+import os
+from os.path import exists
+import click
+import requests
+import csv
+import getpass
+
+dnac_url = None
+dnac_username = None
+dnac_password = None
+dnac_token = None
+
+
+def _abort_command(response):
+    click.echo("Error while sending request to DNAC", err=True)
+    click.echo(f"Status code: {response.status_code}", err=True)
+    click.echo(f"Response {response.text}", err=True)
+    click.Abort()
+
+
+def _get_token():
+    """
+    Retrevies a token using the username and password
+    """
+    global dnac_url
+    global dnac_username
+    global dnac_password
+    global dnac_token
+
+    # Check for requests variables
+    if dnac_url is None:
+        if "DNAC_URL" not in os.environ:
+            dnac_url = input("DNAC URL: (For example: https://dnac-01.example.com) ")
+        else:
+            dnac_url = os.getenv("DNAC_URL")
+    if dnac_username is None:
+        if "DNAC_USER" not in os.environ:
+            dnac_username = input("DNAC username: ")
+        else:
+            dnac_username = os.getenv("DNAC_USER")
+    if dnac_password is None:
+        if "DNAC_PASSWORD" not in os.environ:
+            dnac_password = getpass.getpass("DNAC Password:")
+        else:
+            dnac_password = os.getenv("DNAC_PASSWORD")
+
+    url = f"{dnac_url}/api/system/v1/auth/token"
+    response = requests.request("POST", url, auth=(dnac_username, dnac_password), verify=False)
+    if not response.ok:
+        _abort_command(response)
+    dnac_token = response.json()["Token"]
+
+
+def _make_dnac_request(payload, path, method):
+    """
+    Executes an HTTP request against DNA Center
+    """
+    if dnac_token is None:
+        _get_token()
+    headers = {
+        'Accept': 'application/json',
+        'Content-Type': 'application/json',
+        'x-auth-token': dnac_token
+    }
+    url = f"{dnac_url}{path}"
+    response = requests.request(method, url, headers=headers, json=payload, auth=(dnac_username, dnac_password),
+                                verify=False)
+    if not response.ok:
+        _abort_command(response)
+    return response.json()
+
+
+def _get_site_id(name):
+    """
+    Returns the site ID for a given name
+    :param name: Site name
+    :return: Site ID
+    """
+    response = _make_dnac_request(payload=None, path=f"/dna/intent/api/v1/site?name={name}", method="GET")
+    return response["response"][0]["id"]
+
+
+@click.group()
+def main():
+    """
+    Top level command
+    """
+    pass
+
+
+@click.command()
+@click.option('--inventory-file', "-i", show_default=True, default="./bulk_pnp_access_point.csv",
+              help='File in CSV format that contains access point information. Use option -e for an exaple')
+@click.option('--print-inventory-example', "-e", help='Print example inventory file', type=bool, is_flag=True)
+@click.option('--claim', "-c", help='Claim devices', type=bool, is_flag=True)
+def add_bulk_pnp_access_point(inventory_file, print_inventory_example, claim):
+    """
+    Add APs into DNAC plug and play inventory
+    """
+    if print_inventory_example:
+        example = """device_name,serial_number,product_id,site,rf_profile
+ap_01,1122334455,AIR-AP1815I-B-K9,Global/Colorado - Denver area/Denver Downtown Office/Floor 4,HIGH
+ap_02,6677889911,AIR-AP1815I-B-K9,Global/Colorado - Denver area/Denver Downtown Office/Floor 3,TIPICAL
+ap_03,6677889912,AIR-AP1815I-B-K9,Global/Colorado - Denver area/Denver Downtown Office/Floor 2,LOW"""
+        click.echo(example)
+        return
+    else:
+        # Check for inventory file
+        if not exists(inventory_file):
+            raise click.BadParameter("Inventory file does not exists")
+        payload = []
+        with open(inventory_file, 'r') as inventory_csv:
+            rows = inventory_csv.readlines()[1:]
+            for row in rows:
+                data = row.split(",")
+                device_info = {
+                    "deviceInfo": {
+                        "serialNumber": data[1].strip(),
+                        "name": data[0].strip(),
+                        "deviceType": "AP",
+                        "pid": data[2].strip(),
+                        "hostname": data[0].strip(),
+                        "siteName": data[3].strip(),
+                        "rfProfile": data[4].strip()
+                    }
+                }
+                payload.append(device_info)
+            success_list = _make_dnac_request(payload=payload, path="/dna/intent/api/v1/onboarding/pnp-device/import",
+                                              method="POST")["successList"]
+        click.echo("Devices added successfully")
+        if claim:
+            click.echo("Starting claim")
+            for success_entry in success_list:
+                for payload_item in payload:
+                    if payload_item["deviceInfo"]["serialNumber"] == success_entry["deviceInfo"]["serialNumber"]:
+                        site_id = _get_site_id(name=success_entry["deviceInfo"]["siteName"])
+                        claim_payload = {
+                            "siteId": site_id,
+                            "deviceId": success_entry["id"],
+                            "hostname": success_entry["deviceInfo"]["hostname"],
+                            "type": "AccessPoint",
+                            "rfProfile": payload_item["deviceInfo"]["rfProfile"]
+                        }
+                        _make_dnac_request(payload=claim_payload, method="POST",
+                                           path="/api/v1/onboarding/pnp-device/site-claim")
+                        click.echo(f'Device {success_entry["deviceInfo"]["hostname"]}" claimed')
+                        break
+
+
+main.add_command(add_bulk_pnp_access_point)
+
+if __name__ == '__main__':
+    """
+    Application entry point
+    """
+    main()
